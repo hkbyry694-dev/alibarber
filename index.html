@@ -2732,8 +2732,9 @@ A['sn-rest'] = t => { const id = t.dataset.id; ask('اطلاعات برنامه 
 let bcS = null;
 function stopScan() { if (bcS) { bcS.on = false; try { bcS.stream && bcS.stream.getTracks().forEach(t => t.stop()); } catch (e) {} bcS = null; } }
 function bcBeep() { try { navigator.vibrate && navigator.vibrate(60); const C = window.AudioContext || window.webkitAudioContext; if (!C) return; const c = new C(), o = c.createOscillator(), g = c.createGain(); o.frequency.value = 1100; g.gain.value = .08; o.connect(g); g.connect(c.destination); o.start(); setTimeout(() => { o.stop(); c.close(); }, 110); } catch (e) {} }
-function grayOf(src, sw, sh, maxW) { /* src: video/canvas/img */ const sc = Math.min(1, maxW / sw), w = Math.max(1, Math.round(sw * sc)), h = Math.max(1, Math.round(sh * sc)); const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(src, 0, 0, w, h); const d = x.getImageData(0, 0, w, h).data, g = new Uint8Array(w * h); for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8; return { g, w, h }; }
-function decodeFrame(src, sw, sh, widths) { for (const mw of widths) { const o = grayOf(src, sw, sh, mw); const r = L.decodeBarcode(o.g, o.w, o.h); if (r) return r; } return null; }
+const gcv = document.createElement('canvas'), gcx = gcv.getContext('2d', { willReadFrequently: true });
+function grayOf(src, sw, sh, maxW, band) { /* band: فقط نوار میانی تصویر (۵۵٪ ارتفاع) برای سرعت */ const sc = Math.min(1, maxW / sw), w = Math.max(1, Math.round(sw * sc)), fh = Math.max(1, Math.round(sh * sc)), h = band ? Math.max(1, Math.round(fh * 0.55)) : fh, sy = band ? (sh - sh * 0.55) / 2 : 0, sH = band ? sh * 0.55 : sh; gcv.width = w; gcv.height = h; gcx.drawImage(src, 0, sy, sw, sH, 0, 0, w, h); const d = gcx.getImageData(0, 0, w, h).data, g = new Uint8Array(w * h); for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8; return { g, w, h }; }
+function decodeFrame(src, sw, sh, widths, band) { for (const mw of widths) { const o = grayOf(src, sw, sh, mw, band); const r = L.decodeBarcode(o.g, o.w, o.h); if (r) return r; } return null; }
 function decodePhoto(file) { return new Promise(res => { const u = URL.createObjectURL(file), im = new Image(); im.onload = () => { let r = null; try { r = decodeFrame(im, im.naturalWidth, im.naturalHeight, [1600, 1100, 800, 2200]); } catch (e) {} URL.revokeObjectURL(u); res(r); }; im.onerror = () => { URL.revokeObjectURL(u); res(null); }; im.src = u; }); }
 /* opts.multi: دوربین باز می‌ماند و هر بارکد جدید به cb داده می‌شود */
 async function scanBarcode(cb, opts) {
@@ -2745,21 +2746,22 @@ async function scanBarcode(cb, opts) {
   const got = txt => { if (bcS !== me || !me.on) return; const t = Date.now(); if (txt === last && t - lastT < 2500) { lastT = t; return; } last = txt; lastT = t; bcBeep(); if (opts.multi) { const m = cb(txt); msg(typeof m === 'string' ? m : 'خوانده شد: ' + fa(txt)); } else { stopScan(); closeSheet(w); cb(txt); } };
   $('#bcf', w).onchange = async e => { const f = e.target.files[0]; if (!f) return; msg('در حال خواندن عکس...'); const r = await decodePhoto(f); if (r) got(r); else msg('بارکدی در عکس پیدا نشد. نزدیک‌تر و صاف‌تر و با نور بهتر دوباره بگیر، یا بارکد را تایپ کن.'); e.target.value = ''; };
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { msg('این مرورگر دوربین زنده نمی‌دهد؛ با «عکس گرفتن از بارکد» ادامه بده.'); return; }
-  let stream; try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }); } catch (e) { msg('اجازهٔ دوربین داده نشد (تنظیمات مرورگر → دوربین). می‌توانی با «عکس گرفتن از بارکد» ادامه بدهی.'); return; }
+  let stream; try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } }, audio: false }); } catch (e) { msg('اجازهٔ دوربین داده نشد (تنظیمات مرورگر → دوربین). می‌توانی با «عکس گرفتن از بارکد» ادامه بدهی.'); return; }
   if (bcS !== me) { stream.getTracks().forEach(t => t.stop()); return; }
   me.stream = stream; const v = $('#bcv', w); v.srcObject = stream; try { await v.play(); } catch (e) {}
   msg('بارکد را وسط کادر و صاف بگیر');
+  let n = 0, slow = 0;
   const tick = async () => {
     if (bcS !== me || !me.on) return;
     try {
       if (v.videoWidth) {
         let r = null;
         if (det) { try { const x = await det.detect(v); if (x && x[0]) r = x[0].rawValue; } catch (e) { det = null; } }
-        if (!r) r = decodeFrame(v, v.videoWidth, v.videoHeight, [960, 1280]);
+        if (!r) { n++; const t0 = performance.now(); r = decodeFrame(v, v.videoWidth, v.videoHeight, n % 4 === 0 ? [1280] : n % 2 === 0 ? [1280] : [960], n % 4 !== 0); slow = performance.now() - t0; }
         if (r) got(r);
       }
     } catch (e) {}
-    setTimeout(tick, 140);
+    setTimeout(tick, Math.max(120, slow * 1.5));
   };
   tick();
 }
