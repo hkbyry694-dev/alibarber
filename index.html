@@ -1288,7 +1288,62 @@ function eanFromBits(b) { // b: آرایه 0/1 با طول ۹۵ (EAN-13) یا ۶
   }
   return null;
 }
-function barcodeRow(g) { const a = Array.from(g); for (const arr of [a, a.slice().reverse()]) for (const [wf, th] of [[8, 0.92], [8, 1.0], [5, 0.85], [12, 0.95], [8, 0.8], [4, 1.0]]) { const r = barcodeRow1(arr, wf, th); if (r) return r; } return null; }
+/* ----- خواندن بر پایهٔ عرض نوارها (مقاوم در برابر تاری، لرزش و ضخیم/نازک شدن جوهر) ----- */
+const runsOf = bits => { const o = []; let c = bits[0], n = 1; for (let i = 1; i < bits.length; i++) { if (bits[i] === c) n++; else { o.push(n); c = bits[i]; n = 1; } } o.push(n); return o; };
+const PAT = { L: BC_L.map(runsOf), G: BC_G.map(runsOf), R: BC_R.map(runsOf) };
+function matchDigit(r, k, tabs, lim) { // چهار عرض پشت‌سرهم → رقم
+  const t = r[k] + r[k + 1] + r[k + 2] + r[k + 3]; if (!(t >= 4)) return null;
+  const unit = t / 7; let best = null, bv = 1e9;
+  for (const tag in tabs) for (let d = 0; d < 10; d++) {
+    const p = tabs[tag][d]; let v = 0, bad = false;
+    for (let j = 0; j < 4; j++) { const sp = p[j] * unit, e = Math.abs(r[k + j] - sp) / sp; if (e > 0.8) { bad = true; break; } v += e; }
+    if (!bad && v < bv) { bv = v; best = { d, tag }; }
+  }
+  return best && bv / 4 < (lim || 0.45) ? { d: best.d, tag: best.tag, unit } : null;
+}
+const ok_ = (x, g) => x >= g * 0.5 && x <= g * 1.8;
+function decodeRunsAt(r, i) { // r[i] = اولین میلهٔ گارد شروع
+  const g = (r[i] + r[i + 1] + r[i + 2]) / 3;
+  if (i > 0 && r[i - 1] < g * 3.5) return null; /* حاشیهٔ سکوت قبل از بارکد */
+  for (const n of [6, 4]) {
+    if (i + 3 + n * 8 + 8 > r.length) continue;
+    let k = i + 3, bad = false; const left = [], tags = [], us = [], lim = n === 6 ? 0.45 : 0.3;
+    for (let q = 0; q < n && !bad; q++) { const m = matchDigit(r, k, n === 6 ? { L: PAT.L, G: PAT.G } : { L: PAT.L }, lim); if (!m || !ok_(m.unit, g)) bad = true; else { left.push(m.d); tags.push(m.tag); us.push(m.unit); k += 4; } }
+    if (bad) continue;
+    for (let j = 0; j < 5; j++) if (!ok_(r[k + j], g)) bad = true; if (bad) continue; k += 5;
+    const right = [];
+    for (let q = 0; q < n && !bad; q++) { const m = matchDigit(r, k, { R: PAT.R }, lim); if (!m || !ok_(m.unit, g)) bad = true; else { right.push(m.d); us.push(m.unit); k += 4; } }
+    if (bad) continue;
+    for (let j = 0; j < 3; j++) if (!ok_(r[k + j], g)) bad = true; if (bad) continue;
+    if (k + 3 < r.length && r[k + 3] < g * 3.5) continue; /* حاشیهٔ سکوت بعد از بارکد */
+    const um = us.reduce((a, b) => a + b, 0) / us.length; if (us.some(u => u < um * 0.65 || u > um * 1.5)) continue;
+    let out;
+    if (n === 6) { const first = BC_P.indexOf(tags.join('')); if (first < 0) continue; out = [first, ...left, ...right]; } else out = [...left, ...right];
+    if (eanCheck(out)) return out.join('');
+  }
+  return null;
+}
+function rowRuns(g, wf, th) {
+  const n = g.length; if (n < 80) return null;
+  const sm = new Float32Array(n); for (let i = 0; i < n; i++) sm[i] = ((g[Math.max(0, i - 1)] + g[i] * 2 + g[Math.min(n - 1, i + 1)]) / 4);
+  const w = Math.max(24, n >> (wf === 8 ? 3 : wf === 5 ? 2 : wf === 12 ? 3 : 4)), pre = new Float32Array(n + 1); for (let i = 0; i < n; i++) pre[i + 1] = pre[i] + sm[i];
+  const bin = new Uint8Array(n); for (let i = 0; i < n; i++) { const a = Math.max(0, i - w), c = Math.min(n, i + w), mean = (pre[c] - pre[a]) / (c - a); bin[i] = sm[i] < mean * th ? 1 : 0; }
+  const runs = []; let cur = bin[0], len = 1; for (let i = 1; i < n; i++) { if (bin[i] === cur) len++; else { runs.push(len); cur = bin[i]; len = 1; } } runs.push(len);
+  for (let i = bin[0] === 1 ? 0 : 1; i + 58 < runs.length || i + 42 < runs.length; i += 2) {
+    const a = runs[i], b2 = runs[i + 1], c = runs[i + 2], m0 = (a + b2 + c) / 3; if (m0 < 1.2) continue;
+    if (Math.abs(a - m0) > m0 * 0.6 || Math.abs(b2 - m0) > m0 * 0.6 || Math.abs(c - m0) > m0 * 0.6) continue;
+    const r = decodeRunsAt(runs, i); if (r) return r;
+  }
+  return null;
+}
+const BC_CFG = [[8, 0.92], [8, 1.0], [5, 0.85], [12, 0.95], [8, 0.8], [4, 1.0]];
+function barcodeRow(g, deep) {
+  const a = Array.from(g), cfg = deep === false ? BC_CFG.slice(0, 3) : BC_CFG;
+  for (const arr of [a, a.slice().reverse()]) for (const [wf, th] of cfg) { const r = rowRuns(arr, wf, th); if (r) return r; }
+  if (deep === false) return null;
+  for (const arr of [a, a.slice().reverse()]) for (const [wf, th] of cfg) { const r = barcodeRow1(arr, wf, th); if (r) return r; }
+  return null;
+}
 function barcodeRow1(g, wf, th) { // g: آرایه‌ی روشنایی یک خط؛ خروجی: رشته‌ی بارکد یا null
   const n = g.length; if (n < 60) return null;
   const sm = new Float32Array(n); for (let i = 0; i < n; i++) sm[i] = ((g[Math.max(0, i - 1)] + g[i] * 2 + g[Math.min(n - 1, i + 1)]) / 4);
@@ -1312,13 +1367,23 @@ function barcodeRow1(g, wf, th) { // g: آرایه‌ی روشنایی یک خط
   }
   return null;
 }
-function decodeBarcode(gray, w, h) { // gray: Uint8ClampedArray/Array با w*h پیکسل
-  const tryLine = get => { const line = []; const r1 = barcodeRow(get(false)); if (r1) return r1; const rev = get(false).slice().reverse(); return barcodeRow(rev); };
-  const rowAt = y => { const o = new Float32Array(w); for (let x = 0; x < w; x++) { let s = 0; for (let k = -1; k <= 1; k++) s += gray[Math.min(h - 1, Math.max(0, y + k)) * w + x]; o[x] = s / 3; } return o; };
-  const colAt = x => { const o = new Float32Array(h); for (let y = 0; y < h; y++) { let s = 0; for (let k = -1; k <= 1; k++) s += gray[y * w + Math.min(w - 1, Math.max(0, x + k))]; o[y] = s / 3; } return o; };
-  const T = (arr) => { let r = barcodeRow(arr); if (r) return r; return barcodeRow(Array.from(arr).reverse()); };
-  const ys = [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74, 0.18, 0.82, 0.12, 0.88]; for (const f of ys) { const r = T(rowAt(Math.round(h * f))); if (r) return r; }
-  for (const f of ys) { const r = T(colAt(Math.round(w * f))); if (r) return r; }
+function lineAt(gray, w, h, cx, cy, ang) { // نمونه‌برداری از یک خط مایل (میانگین سه خط موازی)
+  const dx = Math.cos(ang), dy = Math.sin(ang), nx = -dy, ny = dx; let t0 = -1e9, t1 = 1e9;
+  if (Math.abs(dx) > 1e-6) { const a = (2 - cx) / dx, b = (w - 3 - cx) / dx; t0 = Math.max(t0, Math.min(a, b)); t1 = Math.min(t1, Math.max(a, b)); }
+  if (Math.abs(dy) > 1e-6) { const a = (2 - cy) / dy, b = (h - 3 - cy) / dy; t0 = Math.max(t0, Math.min(a, b)); t1 = Math.min(t1, Math.max(a, b)); }
+  const n = Math.floor(t1 - t0); if (!(n >= 80)) return null;
+  const o = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const t = t0 + i; let s = 0; for (let k = -1; k <= 1; k++) { const x = Math.round(cx + t * dx + k * 1.5 * nx), y = Math.round(cy + t * dy + k * 1.5 * ny); s += gray[Math.min(h - 1, Math.max(0, y)) * w + Math.min(w - 1, Math.max(0, x))]; } o[i] = s / 3; }
+  return o;
+}
+function decodeBarcode(gray, w, h, opt) { // gray: آرایهٔ w*h؛ opt.deep=false → سریع (برای دوربین زنده)
+  const deep = !(opt && opt.deep === false), D = Math.PI / 180;
+  const plan = [];
+  for (const f of [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.12, 0.88]) plan.push([0.5, f, 0]);
+  for (const a of [7, -7, 14, -14]) for (const f of [0.5, 0.35, 0.65]) plan.push([0.5, f, a]);
+  for (const f of [0.5, 0.35, 0.65, 0.2, 0.8]) plan.push([f, 0.5, 90]);
+  if (deep) { for (const a of [22, -22, 30, -30]) for (const f of [0.5, 0.35, 0.65]) plan.push([0.5, f, a]); for (const a of [83, 97, 76, 104]) for (const f of [0.5, 0.3, 0.7]) plan.push([f, 0.5, a]); }
+  for (const [fx, fy, a] of plan) { const g = lineAt(gray, w, h, w * fx, h * fy, a * D); if (!g) continue; const r = barcodeRow(g, deep ? true : false); if (r) return r; }
   return null;
 }
 function eanBits(code) { // برای تست و ساخت تصویر نمونه
@@ -2399,7 +2464,7 @@ async function fbInit() {
 }
 function errFa(e) {
   const c = (e && (e.code || e.message)) || '';
-  const m = { 'auth/invalid-credential': 'ایمیل یا رمز اشتباه است.', 'auth/wrong-password': 'رمز اشتباه است.', 'auth/user-not-found': 'حسابی با این ایمیل نیست؛ «ساخت حساب» را بزن.', 'auth/email-already-in-use': 'این ایمیل قبلاً ثبت شده؛ «ورود» را بزن.', 'auth/weak-password': 'رمز باید حداقل ۶ نویسه باشد.', 'auth/invalid-email': 'ایمیل درست نیست.', 'auth/network-request-failed': 'اینترنت وصل نیست.', 'auth/popup-closed-by-user': 'پنجرهٔ ورود بسته شد.', 'auth/unauthorized-domain': 'آدرس سایت در Firebase مجاز نشده (Authorized domains).', 'auth/operation-not-allowed': 'این روش ورود در Firebase روشن نیست.', 'permission-denied': 'دسترسی رد شد؛ قوانین (Rules) Firestore را بررسی کن.', 'unavailable': 'اتصال به سرور ممکن نیست.' };
+  const m = { 'auth/invalid-credential': 'ایمیل یا رمز اشتباه است.', 'auth/wrong-password': 'رمز اشتباه است.', 'auth/user-not-found': 'حسابی با این ایمیل نیست؛ «ساخت حساب» را بزن.', 'auth/email-already-in-use': 'این ایمیل قبلاً ثبت شده؛ «ورود» را بزن.', 'auth/weak-password': 'رمز باید حداقل ۶ نویسه باشد.', 'auth/invalid-email': 'ایمیل درست نیست.', 'auth/network-request-failed': 'اتصال به سرویس Google/Firebase برقرار نشد (ممکن است اینترنت قطع یا سرویس فیلتر باشد). با «ایمیل و رمز» وارد شو.', 'auth/popup-closed-by-user': 'پنجرهٔ ورود بسته شد.', 'auth/unauthorized-domain': 'آدرس سایت در Firebase مجاز نشده (Authorized domains).', 'auth/operation-not-allowed': 'این روش ورود در Firebase روشن نیست.', 'permission-denied': 'دسترسی رد شد؛ قوانین (Rules) Firestore را بررسی کن.', 'unavailable': 'اتصال به سرور ممکن نیست.' };
   for (const k in m) if (c.indexOf(k) >= 0) return m[k]; return 'خطا: ' + c;
 }
 function watch() {
@@ -2733,38 +2798,48 @@ let bcS = null;
 function stopScan() { if (bcS) { bcS.on = false; try { bcS.stream && bcS.stream.getTracks().forEach(t => t.stop()); } catch (e) {} bcS = null; } }
 function bcBeep() { try { navigator.vibrate && navigator.vibrate(60); const C = window.AudioContext || window.webkitAudioContext; if (!C) return; const c = new C(), o = c.createOscillator(), g = c.createGain(); o.frequency.value = 1100; g.gain.value = .08; o.connect(g); g.connect(c.destination); o.start(); setTimeout(() => { o.stop(); c.close(); }, 110); } catch (e) {} }
 const gcv = document.createElement('canvas'), gcx = gcv.getContext('2d', { willReadFrequently: true });
-function grayOf(src, sw, sh, maxW, band) { /* band: فقط نوار میانی تصویر (۵۵٪ ارتفاع) برای سرعت */ const sc = Math.min(1, maxW / sw), w = Math.max(1, Math.round(sw * sc)), fh = Math.max(1, Math.round(sh * sc)), h = band ? Math.max(1, Math.round(fh * 0.55)) : fh, sy = band ? (sh - sh * 0.55) / 2 : 0, sH = band ? sh * 0.55 : sh; gcv.width = w; gcv.height = h; gcx.drawImage(src, 0, sy, sw, sH, 0, 0, w, h); const d = gcx.getImageData(0, 0, w, h).data, g = new Uint8Array(w * h); for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8; return { g, w, h }; }
-function decodeFrame(src, sw, sh, widths, band) { for (const mw of widths) { const o = grayOf(src, sw, sh, mw, band); const r = L.decodeBarcode(o.g, o.w, o.h); if (r) return r; } return null; }
+function grayOf(src, sw, sh, maxW) { /* src: video/canvas/img */ const sc = Math.min(1, maxW / sw), w = Math.max(1, Math.round(sw * sc)), h = Math.max(1, Math.round(sh * sc)); gcv.width = w; gcv.height = h; gcx.drawImage(src, 0, 0, w, h); const d = gcx.getImageData(0, 0, w, h).data, g = new Uint8Array(w * h); for (let i = 0, j = 0; j < g.length; i += 4, j++) g[j] = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8; return { g, w, h }; }
+function decodeFrame(src, sw, sh, widths, deep) { for (const mw of widths) { const o = grayOf(src, sw, sh, mw); const r = L.decodeBarcode(o.g, o.w, o.h, { deep: deep !== false }); if (r) return r; } return null; }
 function decodePhoto(file) { return new Promise(res => { const u = URL.createObjectURL(file), im = new Image(); im.onload = () => { let r = null; try { r = decodeFrame(im, im.naturalWidth, im.naturalHeight, [1600, 1100, 800, 2200]); } catch (e) {} URL.revokeObjectURL(u); res(r); }; im.onerror = () => { URL.revokeObjectURL(u); res(null); }; im.src = u; }); }
 /* opts.multi: دوربین باز می‌ماند و هر بارکد جدید به cb داده می‌شود */
 async function scanBarcode(cb, opts) {
   opts = opts || {}; stopScan();
   let det = null; if ('BarcodeDetector' in window) { try { det = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e'] }); } catch (e) { det = null; } }
-  const w = openSheet('<h3 class="st">' + (opts.multi ? 'اسکن پیاپی بارکد' : 'بارکد را جلوی دوربین بگیر') + '</h3><div class="bcbox"><video id="bcv" class="bcv" playsinline muted autoplay></video><i class="bcl"></i></div><div class="hint" id="bcm" style="text-align:center">در حال باز کردن دوربین...</div><div class="pr"><label class="btn ghost tap" style="text-align:center;cursor:pointer">عکس گرفتن از بارکد<input type="file" id="bcf" accept="image/*" capture="environment" style="display:none"></label><button class="btn ghost tap" data-a="bc-close">' + (opts.multi ? 'پایان' : 'بستن') + '</button></div>');
+  const w = openSheet('<h3 class="st">' + (opts.multi ? 'اسکن پیاپی بارکد' : 'بارکد را جلوی دوربین بگیر') + '</h3><div class="bcbox"><video id="bcv" class="bcv" playsinline muted autoplay></video><i class="bcl"></i></div><div class="fchips" id="bcx"></div><div class="hint" id="bcm" style="text-align:center">در حال باز کردن دوربین...</div><div class="pr"><label class="btn ghost tap" style="text-align:center;cursor:pointer">عکس گرفتن از بارکد<input type="file" id="bcf" accept="image/*" capture="environment" style="display:none"></label><button class="btn ghost tap" data-a="bc-close">' + (opts.multi ? 'پایان' : 'بستن') + '</button></div>');
   const msg = t => { const e = $('#bcm', w); if (e) e.textContent = t; };
   bcS = { on: true, w, stream: null, onEnd: opts.onEnd }; const me = bcS; let last = '', lastT = 0;
-  const got = txt => { if (bcS !== me || !me.on) return; const t = Date.now(); if (txt === last && t - lastT < 2500) { lastT = t; return; } last = txt; lastT = t; bcBeep(); if (opts.multi) { const m = cb(txt); msg(typeof m === 'string' ? m : 'خوانده شد: ' + fa(txt)); } else { stopScan(); closeSheet(w); cb(txt); } };
-  $('#bcf', w).onchange = async e => { const f = e.target.files[0]; if (!f) return; msg('در حال خواندن عکس...'); const r = await decodePhoto(f); if (r) got(r); else msg('بارکدی در عکس پیدا نشد. نزدیک‌تر و صاف‌تر و با نور بهتر دوباره بگیر، یا بارکد را تایپ کن.'); e.target.value = ''; };
+  const cand = {}; const got = (txt, sure) => { if (bcS !== me || !me.on) return; const t = Date.now(); if (!sure) { const c = cand[txt] = (cand[txt] && t - cand[txt].t < 2000 ? { n: cand[txt].n + 1, t } : { n: 1, t }); if (c.n < 2) return; delete cand[txt]; } if (txt === last && t - lastT < 2500) { lastT = t; return; } last = txt; lastT = t; bcBeep(); if (opts.multi) { const m = cb(txt); msg(typeof m === 'string' ? m : 'خوانده شد: ' + fa(txt)); } else { stopScan(); closeSheet(w); cb(txt); } };
+  $('#bcf', w).onchange = async e => { const f = e.target.files[0]; if (!f) return; msg('در حال خواندن عکس...'); const r = await decodePhoto(f); if (r) got(r, true); else msg('بارکدی در عکس پیدا نشد. نزدیک‌تر و صاف‌تر و با نور بهتر دوباره بگیر، یا بارکد را تایپ کن.'); e.target.value = ''; };
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { msg('این مرورگر دوربین زنده نمی‌دهد؛ با «عکس گرفتن از بارکد» ادامه بده.'); return; }
-  let stream; try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } }, audio: false }); } catch (e) { msg('اجازهٔ دوربین داده نشد (تنظیمات مرورگر → دوربین). می‌توانی با «عکس گرفتن از بارکد» ادامه بدهی.'); return; }
+  let stream; try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } }, audio: false }); } catch (e) { msg('اجازهٔ دوربین داده نشد (تنظیمات مرورگر → دوربین). می‌توانی با «عکس گرفتن از بارکد» ادامه بدهی.'); return; }
   if (bcS !== me) { stream.getTracks().forEach(t => t.stop()); return; }
   me.stream = stream; const v = $('#bcv', w); v.srcObject = stream; try { await v.play(); } catch (e) {}
   msg('بارکد را وسط کادر و صاف بگیر');
-  let n = 0, slow = 0;
+  /* فوکوس پیوسته، چراغ و زوم (اگر دستگاه پشتیبانی کند) */
+  try {
+    const tr = stream.getVideoTracks()[0], cap = (tr.getCapabilities && tr.getCapabilities()) || {}, adv = [];
+    if (cap.focusMode && cap.focusMode.includes('continuous')) adv.push({ focusMode: 'continuous' });
+    if (adv.length) await tr.applyConstraints({ advanced: adv }).catch(() => {});
+    const bar = $('#bcx', w);
+    if (bar) { let h = ''; if (cap.torch) h += '<button class="chip tap" data-a="bc-torch">چراغ قوه</button>'; if (cap.zoom && cap.zoom.max > 1.2) h += '<button class="chip tap" data-a="bc-zoom">بزرگ‌نمایی ×۲</button>'; bar.innerHTML = h; me.track = tr; me.cap = cap; }
+  } catch (e) {}
+  let n = 0, dur = 0;
   const tick = async () => {
     if (bcS !== me || !me.on) return;
     try {
       if (v.videoWidth) {
-        let r = null;
-        if (det) { try { const x = await det.detect(v); if (x && x[0]) r = x[0].rawValue; } catch (e) { det = null; } }
-        if (!r) { n++; const t0 = performance.now(); r = decodeFrame(v, v.videoWidth, v.videoHeight, n % 4 === 0 ? [1280] : n % 2 === 0 ? [1280] : [960], n % 4 !== 0); slow = performance.now() - t0; }
-        if (r) got(r);
+        let r = null, sure = false;
+        if (det) { try { const x = await det.detect(v); if (x && x[0]) { r = x[0].rawValue; sure = true; } } catch (e) { det = null; } }
+        if (!r) { n++; const t0 = performance.now(); r = decodeFrame(v, v.videoWidth, v.videoHeight, n % 3 === 0 && dur < 120 ? [1920] : [1280], n % 4 === 0); dur = performance.now() - t0; }
+        if (r) got(r, sure);
       }
     } catch (e) {}
-    setTimeout(tick, Math.max(120, slow * 1.5));
+    setTimeout(tick, Math.max(90, dur * 1.2));
   };
   tick();
 }
+A['bc-torch'] = t => { const m = bcS; if (!m || !m.track) return; m.torchOn = !m.torchOn; m.track.applyConstraints({ advanced: [{ torch: m.torchOn }] }).catch(() => toast('چراغ در این دستگاه روشن نشد.', 1)); t.classList.toggle('on', m.torchOn); };
+A['bc-zoom'] = t => { const m = bcS; if (!m || !m.track) return; m.zoomOn = !m.zoomOn; const z = m.zoomOn ? Math.min(2, m.cap.zoom.max) : (m.cap.zoom.min || 1); m.track.applyConstraints({ advanced: [{ zoom: z }] }).catch(() => {}); t.classList.toggle('on', m.zoomOn); };
 A['bc-close'] = t => { const oe = bcS && bcS.onEnd; stopScan(); closeSheet(t.closest('.sw')); if (oe) oe(); };
 A['g-scan'] = t => scanBarcode(txt => { const e = $('#gbc'); if (e) e.value = fa(en(txt)); });
 function pickProduct(cb, kind) {
